@@ -1,0 +1,544 @@
+cat > main.py << 'EOF'
+# ZEQ - Civil Engineering Project Management System
+# Complete FastAPI Backend with User Auth + DB Schema + Project Management
+
+import os
+import uuid
+import base64
+import io
+import shutil
+from datetime import datetime
+from typing import Optional, List
+
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File as FileUpload, Form, status, BackgroundTasks
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, constr
+from passlib.context import CryptContext
+from sqlalchemy import create_engine, Column, String, Float, DateTime, ForeignKey, Text, Boolean
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship
+from sqlalchemy.exc import IntegrityError
+
+# Use environment variables for secrets/config in production
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./civil_eng.db")
+
+# DB Setup (SQLAlchemy ORM)
+if DATABASE_URL.startswith("sqlite"):
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+else:
+    engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base = declarative_base()
+
+app = FastAPI(title="ZEQ Backend API")
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Password hashing context
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# Database Models
+class User(Base):
+    __tablename__ = "users"
+    username = Column(String, primary_key=True, index=True)
+    hashed_password = Column(String, nullable=False)
+    full_name = Column(String, nullable=True)
+    email = Column(String, nullable=True)
+    role = Column(String, default="contractor")
+    is_active = Column(Boolean, default=True)
+    projects = relationship("Project", back_populates="owner")
+
+class Project(Base):
+    __tablename__ = "projects"
+    id = Column(String, primary_key=True, index=True)
+    name = Column(String, index=True)
+    owner_username = Column(String, ForeignKey("users.username"))
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    owner = relationship("User", back_populates="projects")
+    files = relationship("File", back_populates="project", cascade="all, delete")
+    notes = relationship("Note", back_populates="project", cascade="all, delete")
+    timesheets = relationship("Timesheet", back_populates="project", cascade="all, delete")
+    signatures = relationship("Signature", back_populates="project", cascade="all, delete")
+
+class File(Base):
+    __tablename__ = "files"
+    id = Column(String, primary_key=True, index=True)
+    project_id = Column(String, ForeignKey("projects.id"))
+    filename = Column(String)
+    filetype = Column(String)
+    uploader_username = Column(String, ForeignKey("users.username"))
+    path = Column(String)
+    uploaded_at = Column(DateTime, default=datetime.utcnow)
+    size_bytes = Column(Float)
+    project = relationship("Project", back_populates="files")
+
+class Note(Base):
+    __tablename__ = "notes"
+    id = Column(String, primary_key=True, index=True)
+    project_id = Column(String, ForeignKey("projects.id"))
+    text = Column(Text)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    user_username = Column(String, ForeignKey("users.username"))
+    project = relationship("Project", back_populates="notes")
+
+class Signature(Base):
+    __tablename__ = "signatures"
+    id = Column(String, primary_key=True, index=True)
+    project_id = Column(String, ForeignKey("projects.id"))
+    image_base64 = Column(Text)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    user_username = Column(String, ForeignKey("users.username"))
+    project = relationship("Project", back_populates="signatures")
+
+class Timesheet(Base):
+    __tablename__ = "timesheets"
+    id = Column(String, primary_key=True, index=True)
+    project_id = Column(String, ForeignKey("projects.id"))
+    user_username = Column(String, ForeignKey("users.username"))
+    date = Column(DateTime)
+    hours = Column(Float)
+    description = Column(Text)
+    project = relationship("Project", back_populates="timesheets")
+
+# Create all tables
+Base.metadata.create_all(bind=engine)
+
+# Helper Functions
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def authenticate_user(db_session, username: str, password: str) -> Optional[User]:
+    user = db_session.query(User).filter(User.username == username).first()
+    if not user:
+        return None
+    if not verify_password(password, user.hashed_password):
+        return None
+    return user
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# Token system
+active_tokens = {}
+
+def create_access_token(username: str) -> str:
+    token = str(uuid.uuid4())
+    active_tokens[token] = username
+    return token
+
+async def get_current_user(token: str = Depends(oauth2_scheme), db=Depends(get_db)) -> User:
+    if token not in active_tokens:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication token")
+    username = active_tokens[token]
+    user = db.query(User).filter(User.username == username).first()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Inactive user")
+    return user
+
+# Pydantic Schemas
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    full_name: Optional[str]
+    email: Optional[str]
+    role: Optional[str] = "contractor"
+
+class UserRead(BaseModel):
+    username: str
+    full_name: Optional[str]
+    email: Optional[str]
+    role: str
+    class Config:
+        from_attributes = True
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class ProjectCreate(BaseModel):
+    name: constr(min_length=1)
+    description: Optional[str]
+
+class ProjectRead(BaseModel):
+    id: str
+    name: str
+    description: Optional[str]
+    owner_username: str
+    created_at: datetime
+    class Config:
+        from_attributes = True
+
+class FileRead(BaseModel):
+    id: str
+    filename: str
+    filetype: str
+    uploader_username: str
+    uploaded_at: datetime
+    size_bytes: float
+    class Config:
+        from_attributes = True
+
+class NoteCreate(BaseModel):
+    project_id: str
+    text: constr(min_length=1)
+
+class NoteRead(BaseModel):
+    id: str
+    project_id: str
+    text: str
+    timestamp: datetime
+    user_username: str
+    class Config:
+        from_attributes = True
+
+class SignatureCreate(BaseModel):
+    project_id: str
+    image_base64: str
+
+class SignatureRead(BaseModel):
+    id: str
+    project_id: str
+    image_base64: str
+    timestamp: datetime
+    user_username: str
+    class Config:
+        from_attributes = True
+
+class TimesheetCreate(BaseModel):
+    project_id: str
+    date: datetime
+    hours: float
+    description: Optional[str]
+
+class TimesheetRead(BaseModel):
+    id: str
+    project_id: str
+    user_username: str
+    date: datetime
+    hours: float
+    description: Optional[str]
+    class Config:
+        from_attributes = True
+
+def save_uploaded_file(project_id: str, file: UploadFile) -> str:
+    base_dir = f"uploads/{project_id}"
+    os.makedirs(base_dir, exist_ok=True)
+    filename = os.path.basename(file.filename)
+    save_path = os.path.join(base_dir, filename)
+    with open(save_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+    return save_path
+
+# API Endpoints
+@app.get("/")
+def root():
+    return {
+        "message": "ZEQ Civil Engineering Project Management API",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "health": "/health"
+    }
+
+@app.post("/register", status_code=status.HTTP_201_CREATED, response_model=UserRead)
+def register_user(user: UserCreate, db=Depends(get_db)):
+    db_user = db.query(User).filter(User.username == user.username).first()
+    if db_user:
+        raise HTTPException(status_code=400, detail="Username already exists")
+    hashed_pw = get_password_hash(user.password)
+    new_user = User(
+        username=user.username,
+        hashed_password=hashed_pw,
+        full_name=user.full_name,
+        email=user.email,
+        role=user.role
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return new_user
+
+@app.post("/token", response_model=Token)
+def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db=Depends(get_db)):
+    user = authenticate_user(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+    token = create_access_token(user.username)
+    return {"access_token": token, "token_type": "bearer"}
+
+@app.post("/projects", response_model=ProjectRead, status_code=201)
+def create_project(project: ProjectCreate, current_user: User = Depends(get_current_user), db=Depends(get_db)):
+    new_project = Project(
+        id=str(uuid.uuid4()),
+        name=project.name,
+        description=project.description,
+        owner_username=current_user.username,
+        created_at=datetime.utcnow()
+    )
+    db.add(new_project)
+    db.commit()
+    db.refresh(new_project)
+    return new_project
+
+@app.get("/projects", response_model=List[ProjectRead])
+def list_projects(current_user: User = Depends(get_current_user), db=Depends(get_db)):
+    if current_user.role == "admin":
+        projects = db.query(Project).all()
+    else:
+        projects = db.query(Project).filter(Project.owner_username == current_user.username).all()
+    return projects
+
+@app.get("/projects/{project_id}", response_model=ProjectRead)
+def get_project(project_id: str, current_user: User = Depends(get_current_user), db=Depends(get_db)):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if current_user.role != "admin" and project.owner_username != current_user.username:
+        raise HTTPException(status_code=403, detail="Not authorized to view this project")
+    return project
+
+@app.post("/projects/{project_id}/upload")
+async def upload_file(project_id: str, file: UploadFile = FileUpload(...), current_user: User = Depends(get_current_user), db=Depends(get_db)):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if current_user.role != "admin" and project.owner_username != current_user.username:
+        raise HTTPException(status_code=403, detail="Not authorized to upload to this project")
+
+    ext = os.path.splitext(file.filename)[1].lower()
+    allowed_exts = [".pdf", ".dwg", ".jpg", ".jpeg", ".png", ".tiff", ".bmp", ".gif", ".svg"]
+    if ext not in allowed_exts:
+        raise HTTPException(status_code=400, detail="File type not allowed")
+
+    save_path = save_uploaded_file(project_id, file)
+    new_file = File(
+        id=str(uuid.uuid4()),
+        project_id=project_id,
+        filename=file.filename,
+        filetype=ext,
+        uploader_username=current_user.username,
+        path=save_path,
+        uploaded_at=datetime.utcnow(),
+        size_bytes=os.path.getsize(save_path),
+    )
+    db.add(new_file)
+    db.commit()
+    db.refresh(new_file)
+    return {"msg": "File uploaded successfully", "file_id": new_file.id}
+
+@app.get("/projects/{project_id}/files", response_model=List[FileRead])
+def list_files(project_id: str, current_user: User = Depends(get_current_user), db=Depends(get_db)):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if current_user.role != "admin" and project.owner_username != current_user.username:
+        raise HTTPException(status_code=403, detail="Not authorized to view files")
+    files = db.query(File).filter(File.project_id == project_id).all()
+    return files
+
+@app.get("/projects/{project_id}/files/{file_id}/download")
+def download_file(project_id: str, file_id: str, current_user: User = Depends(get_current_user), db=Depends(get_db)):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if current_user.role != "admin" and project.owner_username != current_user.username:
+        raise HTTPException(status_code=403, detail="Not authorized to download files")
+    file_record = db.query(File).filter(File.id == file_id, File.project_id == project_id).first()
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File not found")
+    if not os.path.exists(file_record.path):
+        raise HTTPException(status_code=404, detail="File not found on disk")
+    def file_generator():
+        with open(file_record.path, "rb") as f:
+            while True:
+                chunk = f.read(8192)
+                if not chunk:
+                    break
+                yield chunk
+    return StreamingResponse(
+        file_generator(),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f"attachment; filename={file_record.filename}"}
+    )
+
+@app.post("/projects/{project_id}/notes", response_model=NoteRead, status_code=201)
+def add_note(project_id: str, note: NoteCreate, current_user: User = Depends(get_current_user), db=Depends(get_db)):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if current_user.role != "admin" and project.owner_username != current_user.username:
+        raise HTTPException(status_code=403, detail="Not authorized to add notes")
+    new_note = Note(
+        id=str(uuid.uuid4()),
+        project_id=project_id,
+        text=note.text,
+        timestamp=datetime.utcnow(),
+        user_username=current_user.username
+    )
+    db.add(new_note)
+    db.commit()
+    db.refresh(new_note)
+    return new_note
+
+@app.get("/projects/{project_id}/notes", response_model=List[NoteRead])
+def list_notes(project_id: str, current_user: User = Depends(get_current_user), db=Depends(get_db)):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if current_user.role != "admin" and project.owner_username != current_user.username:
+        raise HTTPException(status_code=403, detail="Not authorized to view notes")
+    notes = db.query(Note).filter(Note.project_id == project_id).order_by(Note.timestamp.desc()).all()
+    return notes
+
+@app.post("/projects/{project_id}/signatures", response_model=SignatureRead, status_code=201)
+def add_signature(project_id: str, signature: SignatureCreate, current_user: User = Depends(get_current_user), db=Depends(get_db)):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if current_user.role != "admin" and project.owner_username != current_user.username:
+        raise HTTPException(status_code=403, detail="Not authorized to add signatures")
+    new_signature = Signature(
+        id=str(uuid.uuid4()),
+        project_id=project_id,
+        image_base64=signature.image_base64,
+        timestamp=datetime.utcnow(),
+        user_username=current_user.username
+    )
+    db.add(new_signature)
+    db.commit()
+    db.refresh(new_signature)
+    return new_signature
+
+@app.get("/projects/{project_id}/signatures", response_model=List[SignatureRead])
+def list_signatures(project_id: str, current_user: User = Depends(get_current_user), db=Depends(get_db)):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if current_user.role != "admin" and project.owner_username != current_user.username:
+        raise HTTPException(status_code=403, detail="Not authorized to view signatures")
+    signatures = db.query(Signature).filter(Signature.project_id == project_id).order_by(Signature.timestamp.desc()).all()
+    return signatures
+
+@app.post("/projects/{project_id}/timesheets", response_model=TimesheetRead, status_code=201)
+def add_timesheet(project_id: str, timesheet: TimesheetCreate, current_user: User = Depends(get_current_user), db=Depends(get_db)):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if current_user.role != "admin" and project.owner_username != current_user.username:
+        raise HTTPException(status_code=403, detail="Not authorized to add timesheets")
+    new_timesheet = Timesheet(
+        id=str(uuid.uuid4()),
+        project_id=project_id,
+        user_username=current_user.username,
+        date=timesheet.date,
+        hours=timesheet.hours,
+        description=timesheet.description
+    )
+    db.add(new_timesheet)
+    db.commit()
+    db.refresh(new_timesheet)
+    return new_timesheet
+
+@app.get("/projects/{project_id}/timesheets", response_model=List[TimesheetRead])
+def list_timesheets(project_id: str, current_user: User = Depends(get_current_user), db=Depends(get_db)):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if current_user.role != "admin" and project.owner_username != current_user.username:
+        raise HTTPException(status_code=403, detail="Not authorized to view timesheets")
+    timesheets = db.query(Timesheet).filter(Timesheet.project_id == project_id).order_by(Timesheet.date.desc()).all()
+    return timesheets
+
+@app.get("/user", response_model=UserRead)
+def get_current_user_info(current_user: User = Depends(get_current_user)):
+    return current_user
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "timestamp": datetime.utcnow()}
+EOF
+# Create .gitignore
+cat > .gitignore << 'EOF'
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.spyderproject
+.spyproject
+.rope_project
+/.idea
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+civil_eng.db
+uploads/*
+!uploads/.gitkeep
+EOF
+
+# Create pyproject.toml
+cat > pyproject.toml << 'EOF'
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zeq-civil-engineering"
+version = "1.0.0"
+description = "ZEQ - Civil Engineering Project Management System"
+authors = [{name = "Civil Engineering Team"}]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.7"
+dependencies = [
+    "fastapi>=0.100.0",
+    "sqlalchemy>=2.0.0",
+    "passlib[bcrypt]>=1.7.4",
+    "python-multipart>=0.0.6",
+    "uvicorn[standard]>=0.22.0",
+    "psycopg2-binary>=2.9.0"
+]
+pip install fastapi sqlalchemy passlib[bcrypt] python-multipart uvicorn psycopg2-binary
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
